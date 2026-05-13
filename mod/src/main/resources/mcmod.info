@@ -1,0 +1,19 @@
+[
+{
+  "modid": "mumblelink",
+  "name": "MumbleLink",
+  "description": "Provides Mumble positional audio integration for Minecraft 1.6.4 using the LinkAPI native library. Sends player position and orientation to the Mumble client every tick so voice chat is spatial.",
+  "version": "1.1.0",
+  "mcversion": "1.6.4",
+  "url": "https://github.com/Leomist/mumble-LinkAPI1.6.4",
+  "updateUrl": "",
+  "authorList": ["zsawyer", "Leomist"],
+  "credits": "Based on zsawyer's mumble-LinkAPI",
+  "logoFile": "",
+  "screenshots": [],
+  "parent": "",
+  "requiredMods": [],
+  "dependencies": [],
+  "dependants": []
+}
+]
