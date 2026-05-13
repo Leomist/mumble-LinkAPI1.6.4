@@ -17,5 +17,14 @@ Please review the [LinkAPI.h](https://github.com/zsawyer/mumble-LinkAPI/blob/mas
 Changelog:
 ----------
 
+1.1.0
+- reliability overhaul for real-time clients (including Minecraft 1.6.4 integrations):
+  - initialize now always refreshes name/description/version instead of skipping updates when version matches
+  - commit now validates shared-memory initialization (prevents null-pointer crashes)
+  - bounded wide-string writes now guarantee null-termination and clear trailing bytes
+  - context writes now clear stale bytes to avoid leaking old payload data
+  - relock now restores metadata only when backup metadata is known
+- test runner portability/reliability fixes for Linux builds (header case, includes, safer wide-string test setup)
+
 1.0.0
 - basic release version

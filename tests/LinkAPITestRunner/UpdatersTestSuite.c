@@ -2,7 +2,7 @@
 #include "CustomCuTest.h"
 #include "CustomHelperFunctions.h"
 
-#include "linkAPI.h"
+#include "LinkAPI.h"
 
 #include <string.h>
 
@@ -437,7 +437,9 @@ void TestUpdaterSuite_commitVectorsByAvatar(CuTest* tc) {
 CuSuite* UpdatersSuite(void) {
 	CuSuite* suite = CuSuiteNew();
 
-	LINKAPI_ERROR_CODE initError = initialize((wchar_t*) "TestName\0", (wchar_t*) "TestDescription\0", 2);
+	wchar_t name[LINKAPI_MAX_NAME_LENGTH] = L"TestName\0";
+	wchar_t description[LINKAPI_MAX_DESCRIPTION_LENGTH] = L"TestDescription\0";
+	LINKAPI_ERROR_CODE initError = initialize(name, description, 2);
 	if (initError == LINKAPI_ERROR_CODE_NO_ERROR) {
 
 

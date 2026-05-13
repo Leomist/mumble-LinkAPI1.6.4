@@ -9,6 +9,7 @@
 #    define	CUSTOMHELPERFUNCTIONS_H
 
 #    include "CuTest.h"
+#    include <stddef.h>
 
 #    ifdef	__cplusplus
 extern "C" {
