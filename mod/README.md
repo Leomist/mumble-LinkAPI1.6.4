@@ -12,7 +12,7 @@ native C library. Drop the release JAR into your `mods/` folder and start Minecr
 
 ## How it works
 
-Every client tick (`FMLCommonHandler` tick event), the mod:
+Every ~50 ms (background daemon thread at 20 Hz), the mod:
 
 | Step | What it does |
 |------|-------------|

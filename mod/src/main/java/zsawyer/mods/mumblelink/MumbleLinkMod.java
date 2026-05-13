@@ -19,7 +19,6 @@
  */
 package zsawyer.mods.mumblelink;
 
-import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
@@ -28,7 +27,6 @@ import zsawyer.mods.mumblelink.handler.TickHandler;
 import zsawyer.mods.mumblelink.util.NativeLoader;
 import zsawyer.mumble.jna.LinkAPILibrary;
 
-import java.lang.reflect.Method;
 import java.util.logging.Logger;
 
 /**
@@ -56,7 +54,7 @@ public final class MumbleLinkMod {
 
     public static final String MODID   = "mumblelink";
     public static final String NAME    = "MumbleLink";
-    public static final String VERSION = "1.1.1";
+    public static final String VERSION = "1.1.2";
 
     @Mod.Instance(MODID)
     public static MumbleLinkMod INSTANCE;
@@ -86,7 +84,13 @@ public final class MumbleLinkMod {
     }
 
     /**
-     * Initialisation: load the JNA wrapper and register the tick handler.
+     * Initialisation: load the JNA wrapper and start the background link thread.
+     *
+     * <p>Using a background daemon thread instead of the FML event bus ensures
+     * compatibility across all 1.6.4 Forge builds regardless of which EventBus
+     * API variant (FML's own EventBus vs Guava EventBus) is present at runtime.
+     * The thread polls Minecraft state at ~20 Hz, which is the rate Mumble's
+     * Link plugin expects.
      */
     @Mod.EventHandler
     @SuppressWarnings("unchecked")
@@ -95,33 +99,14 @@ public final class MumbleLinkMod {
         try {
             api = (LinkAPILibrary) Native.loadLibrary(
                     "LinkAPI", LinkAPILibrary.class);
-            registerTickHandler(new TickHandler(api));
+            Thread t = new Thread(new TickHandler(api), "MumbleLink");
+            t.setDaemon(true);
+            t.start();
             LOGGER.info("[MumbleLink] Initialised successfully – "
-                    + "positional audio is active");
+                    + "link thread started");
         } catch (Exception e) {
             LOGGER.severe("[MumbleLink] Initialisation failed: "
                     + e.getMessage());
         }
-    }
-
-    /**
-     * Registers the client tick handler on the FML event bus using reflection.
-     *
-     * <p>This avoids bytecode linkage against a specific return type of
-     * {@code FMLCommonHandler#bus()}, which differs across some 1.6.4 FML
-     * builds and can otherwise trigger {@link NoSuchMethodError} at runtime.
-     */
-    private static void registerTickHandler(Object handler) throws Exception {
-        Object commonHandler = FMLCommonHandler.instance();
-        Method busMethod;
-        try {
-            busMethod = commonHandler.getClass().getMethod("bus");
-        } catch (NoSuchMethodException e) {
-            busMethod = commonHandler.getClass().getMethod("eventBus");
-        }
-
-        Object bus = busMethod.invoke(commonHandler);
-        Method registerMethod = bus.getClass().getMethod("register", Object.class);
-        registerMethod.invoke(bus, handler);
     }
 }

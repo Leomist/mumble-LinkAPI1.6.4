@@ -19,8 +19,6 @@
  */
 package zsawyer.mods.mumblelink.handler;
 
-import cpw.mods.fml.common.eventhandler.SubscribeEvent;
-import cpw.mods.fml.common.gameevent.TickEvent;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityClientPlayerMP;
 import zsawyer.mumble.jna.LinkAPILibrary;
@@ -29,25 +27,30 @@ import java.util.Arrays;
 import java.util.logging.Logger;
 
 /**
- * Forge client-tick event handler that pipes Minecraft player position and
- * look direction to Mumble via the native LinkAPI library every tick.
+ * Background daemon thread that keeps Mumble's shared-memory link alive while
+ * Minecraft is running a world.
  *
- * <p>Registration: call {@code FMLCommonHandler.instance().bus().register(new TickHandler(api))}
- * from {@code FMLInitializationEvent}.
+ * <p>This implementation polls Minecraft state every {@value #POLL_MS} ms so
+ * that it works regardless of which Forge / FML event-bus API variant is
+ * present at runtime.  The Mumble Link protocol requires position updates at
+ * roughly 20 Hz (50 ms), so polling at 50 ms is sufficient.
  *
  * <p>Coordinate mapping:
  * <ul>
- *   <li>Minecraft X (East +) → Mumble X</li>
- *   <li>Minecraft Y (Up +)   → Mumble Y</li>
- *   <li>Minecraft Z (South +)→ Mumble Z</li>
+ *   <li>Minecraft X (East +)  → Mumble X</li>
+ *   <li>Minecraft Y (Up +)    → Mumble Y</li>
+ *   <li>Minecraft Z (South +) → Mumble Z</li>
  * </ul>
  */
-public final class TickHandler {
+public final class TickHandler implements Runnable {
 
     private static final Logger LOGGER = Logger.getLogger("mumblelink");
 
     private static final String APP_NAME        = "Minecraft";
     private static final String APP_DESCRIPTION = "Minecraft 1.6.4 MumbleLink positional audio";
+
+    /** Poll interval in milliseconds – 50 ms ≈ 20 Hz, the rate Mumble expects. */
+    private static final long POLL_MS = 50L;
 
     private final LinkAPILibrary api;
 
@@ -58,23 +61,43 @@ public final class TickHandler {
         this.api = api;
     }
 
-    /**
-     * Called each client tick.  On {@link TickEvent.Phase#START} only, reads
-     * the current player state and commits updated positional data to Mumble.
-     */
-    @SubscribeEvent
-    public void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase != TickEvent.Phase.START) {
-            return;
-        }
+    // -----------------------------------------------------------------------
+    // Runnable
+    // -----------------------------------------------------------------------
 
+    @Override
+    public void run() {
+        LOGGER.info("[MumbleLink] Link thread started");
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                tick();
+            } catch (Exception e) {
+                LOGGER.warning("[MumbleLink] Error in link thread: " + e);
+            }
+            try {
+                Thread.sleep(POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        LOGGER.info("[MumbleLink] Link thread stopped");
+    }
+
+    // -----------------------------------------------------------------------
+
+    private void tick() {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc == null || mc.thePlayer == null || mc.theWorld == null) {
             if (linked) {
-                api.unlinkMumble();
-                linked = false;
+                try {
+                    api.unlinkMumble();
+                } catch (Exception e) {
+                    LOGGER.fine("[MumbleLink] unlinkMumble error: " + e);
+                }
+                linked      = false;
                 lastContext = "";
-                LOGGER.info("[MumbleLink] Unlinked from Mumble (no world)");
+                LOGGER.info("[MumbleLink] Unlinked from Mumble (no active world)");
             }
             return;
         }
@@ -86,9 +109,11 @@ public final class TickHandler {
             int err = api.initialize(name, desc, 2);
             if (err == LinkAPILibrary.LINKAPI_ERROR_CODE.LINKAPI_ERROR_CODE_NO_ERROR) {
                 linked = true;
-                LOGGER.info("[MumbleLink] Linked to Mumble");
+                LOGGER.info("[MumbleLink] Linked to Mumble – positional audio active");
             } else {
-                LOGGER.warning("[MumbleLink] initialize() returned error " + err);
+                // Mumble not running yet – log at FINE to avoid log spam.
+                LOGGER.fine("[MumbleLink] Waiting for Mumble Link"
+                        + " (initialize returned " + err + ")");
             }
             return;
         }
@@ -97,9 +122,9 @@ public final class TickHandler {
 
         // ---- Position (eye position in metres / blocks) ------------------
         float[] pos = {
-            (float) player.posX,
+            (float)  player.posX,
             (float) (player.posY + player.getEyeHeight()),
-            (float) player.posZ
+            (float)  player.posZ
         };
 
         // ---- Look vector from yaw / pitch --------------------------------

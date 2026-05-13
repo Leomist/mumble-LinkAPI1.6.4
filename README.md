@@ -17,7 +17,12 @@ Please review the [LinkAPI.h](https://github.com/zsawyer/mumble-LinkAPI/blob/mas
 Changelog:
 ----------
 
-1.1.1
+1.1.2
+- forge compatibility fix (part 2 – link actually works now):
+  - replace FML event-bus registration with a background daemon thread (50 ms / 20 Hz)
+  - the previous reflection approach was still silently broken: Guava EventBus ignores `@SubscribeEvent`; some 1.6.4 FML builds have no `bus()` method at all
+  - thread approach is independent of FML EventBus API version; no silent registration failures
+
 - minecraft 1.6.4 forge compatibility fix:
   - avoid hard-linking against one specific FMLCommonHandler#bus() return type
   - register tick handler via reflection to support 1.6.4 FML variants without NoSuchMethodError
