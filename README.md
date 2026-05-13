@@ -17,6 +17,11 @@ Please review the [LinkAPI.h](https://github.com/zsawyer/mumble-LinkAPI/blob/mas
 Changelog:
 ----------
 
+1.1.1
+- minecraft 1.6.4 forge compatibility fix:
+  - avoid hard-linking against one specific FMLCommonHandler#bus() return type
+  - register tick handler via reflection to support 1.6.4 FML variants without NoSuchMethodError
+
 1.1.0
 - reliability overhaul for real-time clients (including Minecraft 1.6.4 integrations):
   - initialize now always refreshes name/description/version instead of skipping updates when version matches

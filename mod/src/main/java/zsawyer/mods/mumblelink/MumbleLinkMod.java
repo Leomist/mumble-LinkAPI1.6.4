@@ -28,6 +28,7 @@ import zsawyer.mods.mumblelink.handler.TickHandler;
 import zsawyer.mods.mumblelink.util.NativeLoader;
 import zsawyer.mumble.jna.LinkAPILibrary;
 
+import java.lang.reflect.Method;
 import java.util.logging.Logger;
 
 /**
@@ -55,7 +56,7 @@ public final class MumbleLinkMod {
 
     public static final String MODID   = "mumblelink";
     public static final String NAME    = "MumbleLink";
-    public static final String VERSION = "1.1.0";
+    public static final String VERSION = "1.1.1";
 
     @Mod.Instance(MODID)
     public static MumbleLinkMod INSTANCE;
@@ -94,12 +95,33 @@ public final class MumbleLinkMod {
         try {
             api = (LinkAPILibrary) Native.loadLibrary(
                     "LinkAPI", LinkAPILibrary.class);
-            FMLCommonHandler.instance().bus().register(new TickHandler(api));
+            registerTickHandler(new TickHandler(api));
             LOGGER.info("[MumbleLink] Initialised successfully – "
                     + "positional audio is active");
         } catch (Exception e) {
             LOGGER.severe("[MumbleLink] Initialisation failed: "
                     + e.getMessage());
         }
+    }
+
+    /**
+     * Registers the client tick handler on the FML event bus using reflection.
+     *
+     * <p>This avoids bytecode linkage against a specific return type of
+     * {@code FMLCommonHandler#bus()}, which differs across some 1.6.4 FML
+     * builds and can otherwise trigger {@link NoSuchMethodError} at runtime.
+     */
+    private static void registerTickHandler(Object handler) throws Exception {
+        Object commonHandler = FMLCommonHandler.instance();
+        Method busMethod;
+        try {
+            busMethod = commonHandler.getClass().getMethod("bus");
+        } catch (NoSuchMethodException e) {
+            busMethod = commonHandler.getClass().getMethod("eventBus");
+        }
+
+        Object bus = busMethod.invoke(commonHandler);
+        Method registerMethod = bus.getClass().getMethod("register", Object.class);
+        registerMethod.invoke(bus, handler);
     }
 }
