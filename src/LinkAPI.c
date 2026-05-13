@@ -73,8 +73,8 @@ static void copyBoundedWCharArray(
 		destination[i] = source[i];
 	}
 	destination[i] = L'\0';
-	for (++i; i < count; ++i) {
-		destination[i] = L'\0';
+	if (++i < count) {
+		wmemset(destination + i, L'\0', count - i);
 	}
 }
 
@@ -284,11 +284,11 @@ LINKAPI_ERROR_CODE setContext(
 	if (contextLength > LINKAPI_MAX_CONTEXT_LENGTH) {
 		return LINKAPI_ERROR_CODE_CONTEXT_LENGTH_EXCEEDED;
 	}
+	lm->contextLength = contextLength;
+	memcpy(lm->context, context, contextLength * sizeof (unsigned char));
 	if (contextLength < LINKAPI_MAX_CONTEXT_LENGTH) {
 		memset(&lm->context[contextLength], 0, (LINKAPI_MAX_CONTEXT_LENGTH - contextLength) * sizeof (unsigned char));
 	}
-	lm->contextLength = contextLength;
-	memcpy(lm->context, context, contextLength * sizeof (unsigned char));
 
 	return LINKAPI_ERROR_CODE_NO_ERROR;
 }
