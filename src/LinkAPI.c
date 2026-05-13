@@ -109,6 +109,9 @@ LINKAPI_ERROR_CODE nativeInitialize() {
 		return LINKAPI_ERROR_CODE_NO_STRUCTURE;
 	}
 #endif
+	if (lm == NULL) {
+		return LINKAPI_ERROR_CODE_NO_MEMORY_WAS_INITIALIZED;
+	}
 	if (!hasBackupLinkMetaData) {
 		copyBoundedWCharArray(backupName, lm->name, LINKAPI_MAX_NAME_LENGTH);
 		copyBoundedWCharArray(backupDescription, lm->description, LINKAPI_MAX_DESCRIPTION_LENGTH);
@@ -281,8 +284,10 @@ LINKAPI_ERROR_CODE setContext(
 	if (contextLength > LINKAPI_MAX_CONTEXT_LENGTH) {
 		return LINKAPI_ERROR_CODE_CONTEXT_LENGTH_EXCEEDED;
 	}
+	if (contextLength < LINKAPI_MAX_CONTEXT_LENGTH) {
+		memset(&lm->context[contextLength], 0, (LINKAPI_MAX_CONTEXT_LENGTH - contextLength) * sizeof (unsigned char));
+	}
 	lm->contextLength = contextLength;
-	memset(lm->context, 0, LINKAPI_MAX_CONTEXT_LENGTH * sizeof (unsigned char));
 	memcpy(lm->context, context, contextLength * sizeof (unsigned char));
 
 	return LINKAPI_ERROR_CODE_NO_ERROR;

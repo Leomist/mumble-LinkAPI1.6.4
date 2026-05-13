@@ -359,8 +359,8 @@ void TestSettersSuite_setNameNullTerminatesFullBufferInput(CuTest* tc) {
 }
 
 void TestSettersSuite_setContextClearsStaleBytes(CuTest* tc) {
-	unsigned char longerContext[LINKAPI_MAX_CONTEXT_LENGTH] = "LongerContextData\0";
-	unsigned char shorterContext[LINKAPI_MAX_CONTEXT_LENGTH] = "Short\0";
+	unsigned char longerContext[LINKAPI_MAX_CONTEXT_LENGTH] = "LongerContextData";
+	unsigned char shorterContext[LINKAPI_MAX_CONTEXT_LENGTH] = "Short";
 	size_t longerLength = strlen((char*) longerContext);
 	size_t shorterLength = strlen((char*) shorterContext);
 
@@ -369,7 +369,7 @@ void TestSettersSuite_setContextClearsStaleBytes(CuTest* tc) {
 	err = setContext(shorterContext, shorterLength);
 	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
 
-	CuAssertIntEquals(tc, 0, lm->context[shorterLength + 1]);
+	CuAssertIntEquals(tc, 0, lm->context[shorterLength]);
 }
 
 void TestSettersSuite_setData(CuTest* tc) {
