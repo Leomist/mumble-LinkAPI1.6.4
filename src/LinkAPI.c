@@ -52,6 +52,32 @@ static LINKAPI_LINKED_MEMORY *lm = NULL;
 #define LINKAPI_VERIFY_LM			if (!lm) { return LINKAPI_ERROR_CODE_NO_MEMORY_WAS_INITIALIZED; }
 #define LINKAPI_VERIFY_NO_ERROR 	if (err != LINKAPI_ERROR_CODE_NO_ERROR) { return err; }
 
+static wchar_t backupName[LINKAPI_MAX_NAME_LENGTH];
+static wchar_t backupDescription[LINKAPI_MAX_DESCRIPTION_LENGTH];
+static LINKAPI_NATIVE_UINT32 backupUiVersion;
+static int hasBackupLinkMetaData = 0;
+
+static void copyBoundedWCharArray(
+		wchar_t* destination,
+		const wchar_t* source,
+		int count) {
+	int i;
+	if (count <= 0) {
+		return;
+	}
+	if (!source) {
+		destination[0] = L'\0';
+		return;
+	}
+	for (i = 0; i < count - 1 && source[i] != L'\0'; ++i) {
+		destination[i] = source[i];
+	}
+	destination[i] = L'\0';
+	if (++i < count) {
+		wmemset(destination + i, L'\0', count - i);
+	}
+}
+
 LINKAPI_ERROR_CODE nativeInitialize() {
 #ifdef WIN32
 	HANDLE hMapObject = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, L"MumbleLink");
@@ -83,13 +109,18 @@ LINKAPI_ERROR_CODE nativeInitialize() {
 		return LINKAPI_ERROR_CODE_NO_STRUCTURE;
 	}
 #endif
+	if (lm == NULL) {
+		return LINKAPI_ERROR_CODE_NO_MEMORY_WAS_INITIALIZED;
+	}
+	if (!hasBackupLinkMetaData) {
+		copyBoundedWCharArray(backupName, lm->name, LINKAPI_MAX_NAME_LENGTH);
+		copyBoundedWCharArray(backupDescription, lm->description, LINKAPI_MAX_DESCRIPTION_LENGTH);
+		backupUiVersion = lm->version;
+		hasBackupLinkMetaData = 1;
+	}
 
 	return LINKAPI_ERROR_CODE_NO_ERROR;
 }
-
-static wchar_t backupName[LINKAPI_MAX_NAME_LENGTH];
-static wchar_t backupDescription[LINKAPI_MAX_DESCRIPTION_LENGTH];
-static LINKAPI_NATIVE_UINT32 backupUiVersion;
 
 LINKAPI_ERROR_CODE initialize(
 		const wchar_t name[LINKAPI_MAX_NAME_LENGTH],
@@ -101,14 +132,12 @@ LINKAPI_ERROR_CODE initialize(
 	LINKAPI_VERIFY_NO_ERROR;
 
 	LINKAPI_VERIFY_LM;
-	if (lm->version != version) {
-		err = setName(name);
-		LINKAPI_VERIFY_NO_ERROR;
-		err = setDescription(description);
-		LINKAPI_VERIFY_NO_ERROR;
-		err = setVersion(version);
-		LINKAPI_VERIFY_NO_ERROR;
-	}
+	err = setName(name);
+	LINKAPI_VERIFY_NO_ERROR;
+	err = setDescription(description);
+	LINKAPI_VERIFY_NO_ERROR;
+	err = setVersion(version);
+	LINKAPI_VERIFY_NO_ERROR;
 	err = setTick(0);
 
 	return err;
@@ -125,9 +154,12 @@ LINKAPI_ERROR_CODE initialize(
  */
 LINKAPI_ERROR_CODE relock() {
 	LINKAPI_VERIFY_LM;
+	if (!hasBackupLinkMetaData) {
+		return LINKAPI_ERROR_CODE_NO_ERROR;
+	}
 	if (lm->version != backupUiVersion) {
-		wcsncpy(lm->name, backupName, LINKAPI_MAX_NAME_LENGTH);
-		wcsncpy(lm->description, backupDescription, LINKAPI_MAX_DESCRIPTION_LENGTH);
+		copyBoundedWCharArray(lm->name, backupName, LINKAPI_MAX_NAME_LENGTH);
+		copyBoundedWCharArray(lm->description, backupDescription, LINKAPI_MAX_DESCRIPTION_LENGTH);
 
 		lm->version = backupUiVersion;
 	}
@@ -157,6 +189,7 @@ LINKAPI_ERROR_CODE commitOnNoError(LINKAPI_ERROR_CODE previousCode) {
 }
 
 LINKAPI_ERROR_CODE commit() {
+	LINKAPI_VERIFY_LM;
 	lm->tick++;
 	return relock();
 }
@@ -166,7 +199,7 @@ LINKAPI_ERROR_CODE setWCharTArray(
 		const wchar_t* source,
 		int count) {
 	LINKAPI_VERIFY_LM;
-	wcsncpy(destination, source, count);
+	copyBoundedWCharArray(destination, source, count);
 	return LINKAPI_ERROR_CODE_NO_ERROR;
 }
 
@@ -253,6 +286,9 @@ LINKAPI_ERROR_CODE setContext(
 	}
 	lm->contextLength = contextLength;
 	memcpy(lm->context, context, contextLength * sizeof (unsigned char));
+	if (contextLength < LINKAPI_MAX_CONTEXT_LENGTH) {
+		memset(&lm->context[contextLength], 0, (LINKAPI_MAX_CONTEXT_LENGTH - contextLength) * sizeof (unsigned char));
+	}
 
 	return LINKAPI_ERROR_CODE_NO_ERROR;
 }

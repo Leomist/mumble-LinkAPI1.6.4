@@ -2,7 +2,7 @@
 #include "CustomCuTest.h"
 #include "CustomHelperFunctions.h"
 
-#include "linkAPI.h"
+#include "LinkAPI.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -346,6 +346,32 @@ void TestSettersSuite_setIdentityAndContext(CuTest* tc) {
 	CuAssertCharArrayEquals(tc, text3ExcerptB, text3Excerpt, 256);
 }
 
+void TestSettersSuite_setNameNullTerminatesFullBufferInput(CuTest* tc) {
+	wchar_t text[LINKAPI_MAX_NAME_LENGTH];
+	int i;
+	for (i = 0; i < LINKAPI_MAX_NAME_LENGTH; ++i) {
+		text[i] = L'A';
+	}
+
+	LINKAPI_ERROR_CODE err = setName(text);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+	CuAssertIntEquals(tc, 0, lm->name[LINKAPI_MAX_NAME_LENGTH - 1]);
+}
+
+void TestSettersSuite_setContextClearsStaleBytes(CuTest* tc) {
+	unsigned char longerContext[LINKAPI_MAX_CONTEXT_LENGTH] = "LongerContextData";
+	unsigned char shorterContext[LINKAPI_MAX_CONTEXT_LENGTH] = "Short";
+	size_t longerLength = strlen((char*) longerContext);
+	size_t shorterLength = strlen((char*) shorterContext);
+
+	LINKAPI_ERROR_CODE err = setContext(longerContext, longerLength);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+	err = setContext(shorterContext, shorterLength);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+
+	CuAssertIntEquals(tc, 0, lm->context[shorterLength]);
+}
+
 void TestSettersSuite_setData(CuTest* tc) {
 	size_t lmSize = sizeof (LINKAPI_LINKED_MEMORY);
 	LINKAPI_LINKED_MEMORY data;
@@ -662,7 +688,9 @@ void addVectorTests(CuSuite* suite) {
 CuSuite* SettersSuite(void) {
 	CuSuite* suite = CuSuiteNew();
 
-	LINKAPI_ERROR_CODE initError = initialize((wchar_t*) "TestName\0", (wchar_t*) "TestDescription\0", 2);
+	wchar_t name[LINKAPI_MAX_NAME_LENGTH] = L"TestName\0";
+	wchar_t description[LINKAPI_MAX_DESCRIPTION_LENGTH] = L"TestDescription\0";
+	LINKAPI_ERROR_CODE initError = initialize(name, description, 2);
 	if (initError == LINKAPI_ERROR_CODE_NO_ERROR) {
 
 		SUITE_ADD_TEST(suite, TestSettersSuite_setUiTick);
@@ -672,6 +700,8 @@ CuSuite* SettersSuite(void) {
 		SUITE_ADD_TEST(suite, TestSettersSuite_setDescription);
 		SUITE_ADD_TEST(suite, TestSettersSuite_setContext);
 		SUITE_ADD_TEST(suite, TestSettersSuite_setIdentityAndContext);
+		SUITE_ADD_TEST(suite, TestSettersSuite_setNameNullTerminatesFullBufferInput);
+		SUITE_ADD_TEST(suite, TestSettersSuite_setContextClearsStaleBytes);
 		SUITE_ADD_TEST(suite, TestSettersSuite_setVectors);
 		SUITE_ADD_TEST(suite, TestSettersSuite_setData);
 		SUITE_ADD_TEST(suite, TestSettersSuite_setVectorsByAvatar);

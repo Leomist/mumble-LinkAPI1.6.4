@@ -1,0 +1,703 @@
+/*
+ * Copyright (C) 2013, zsawyer <zsawyer@users.sourceforge.net>
+ * Modifications Copyright (C) 2014, Leomist
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ * - Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.
+ */
+package zsawyer.mods.mumblelink.handler;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.EntityClientPlayerMP;
+import zsawyer.mods.mumblelink.MumbleLink;
+import zsawyer.mods.mumblelink.MumbleLinkMod;
+
+import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.logging.Logger;
+
+/**
+ * Background daemon thread that keeps Mumble's shared-memory link alive while
+ * Minecraft is running a world.
+ *
+ * <p>This implementation polls Minecraft state every {@value #POLL_MS} ms and
+ * writes positional audio data directly to Mumble's shared-memory segment via
+ * {@link MumbleLink}.  It does not depend on any intermediate native helper
+ * library (DLL/SO).
+ *
+ * <p>State transitions trigger formatted in-game chat messages so the player
+ * always knows the current Mumble link status:
+ * <ul>
+ *   <li>World join   – header banner + current status (searching or active)</li>
+ *   <li>Link established  – green ACTIVE message with server/player details</li>
+ *   <li>Link lost    – red INACTIVE message with retry hint</li>
+ *   <li>Link restored     – green RESTORED message</li>
+ *   <li>Context change    – gold UPDATE message showing new server context</li>
+ * </ul>
+ *
+ * <p>Coordinate mapping:
+ * <ul>
+ *   <li>Minecraft X (East +)   → Mumble X</li>
+ *   <li>Minecraft Y (Up +)     → Mumble Y</li>
+ *   <li>Minecraft Z (South +)  → Mumble Z</li>
+ * </ul>
+ */
+public final class TickHandler implements Runnable {
+
+    private static final Logger LOGGER = Logger.getLogger("mumblelink");
+
+    private static final String APP_NAME        = "Minecraft";
+    private static final String APP_DESCRIPTION = "Minecraft 1.6.4 MumbleLink positional audio";
+
+    /** Poll interval in milliseconds – 50 ms = 20 Hz, the rate Mumble expects. */
+    private static final long POLL_MS = 50L;
+
+    /** Chat format codes (§ sequences). */
+    private static final String C_RESET  = "\u00a7r";
+    private static final String C_GREEN  = "\u00a7a";
+    private static final String C_RED    = "\u00a7c";
+    private static final String C_GOLD   = "\u00a76";
+    private static final String C_GRAY   = "\u00a77";
+    private static final String C_WHITE  = "\u00a7f";
+    private static final String C_BOLD   = "\u00a7l";
+    private static final String C_YELLOW = "\u00a7e";
+
+    /** Prefix used on every chat message this mod sends. */
+    private static final String PREFIX =
+            C_GOLD + C_BOLD + "[MumbleLink]" + C_RESET + " ";
+
+    /** Live link to Mumble shared memory; null when not yet opened. */
+    private MumbleLink link = null;
+
+    /** Cached context string to avoid writing on every tick. */
+    private String lastContext = "";
+
+    /** Whether the player was in a world on the previous tick. */
+    private boolean wasInWorld = false;
+
+    /**
+     * Whether the link was active when it was last opened this session.
+     * Used to distinguish "established for the first time" vs "restored
+     * after a drop" so each gets the right message.
+     */
+    private boolean wasPreviouslyLinked = false;
+
+    /**
+     * Thread-safe queue for chat messages to be delivered to the player.
+     * Messages are enqueued by state-transition logic and dequeued each
+     * tick when mc.thePlayer is available.
+     */
+    private final ConcurrentLinkedQueue<PendingChatMessage> pendingMessages =
+            new ConcurrentLinkedQueue<PendingChatMessage>();
+
+    /** Cached reflective method for player chat delivery. */
+    private transient Method cachedAddChatMethod = null;
+
+    /** Cached constructor for net.minecraft.util.ChatComponentText(String). */
+    private transient Constructor<?> cachedChatComponentCtor = null;
+
+    /** Cached reflective fallback for gui chat print methods. */
+    private transient Method cachedGuiPrintMethod = null;
+
+    /** Runtime stats for /mumble diagnostics. */
+    private volatile long threadStartMs       = 0L;
+    private volatile long tickCount           = 0L;
+    private volatile long worldJoinCount      = 0L;
+    private volatile long worldLeaveCount     = 0L;
+    private volatile long linkOpenAttempts    = 0L;
+    private volatile long linkOpenSuccesses   = 0L;
+    private volatile long linkLossCount       = 0L;
+    private volatile long linkWriteFailures   = 0L;
+    private volatile long chatSentCount       = 0L;
+    private volatile long chatSendFailures    = 0L;
+    private volatile long chatRetryCount      = 0L;
+    private volatile long joinBannerCount     = 0L;
+    private volatile long lastTickMs          = 0L;
+    private volatile long lastErrorMs         = 0L;
+    private volatile String lastError         = "";
+    private volatile String lastKnownPlayer   = "";
+    private volatile String lastKnownContext  = "mumblelink|unknown";
+    private volatile float lastPosX           = 0f;
+    private volatile float lastPosY           = 0f;
+    private volatile float lastPosZ           = 0f;
+    private volatile float lastFrontX         = 0f;
+    private volatile float lastFrontY         = 0f;
+    private volatile float lastFrontZ         = 0f;
+    private volatile String chatDeliveryMode  = "unresolved";
+
+    private static final int MAX_CHAT_RETRIES = 5;
+
+    /** Queue payload with retry count so failed sends are not dropped. */
+    private static final class PendingChatMessage {
+        private final String text;
+        private final int attempts;
+
+        private PendingChatMessage(String text, int attempts) {
+            this.text = text;
+            this.attempts = attempts;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Runnable
+    // -----------------------------------------------------------------------
+
+    @Override
+    public void run() {
+        threadStartMs = System.currentTimeMillis();
+        LOGGER.info("[MumbleLink] Link thread started");
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                tick();
+            } catch (Exception e) {
+                recordError("Tick loop error: " + e);
+                LOGGER.warning("[MumbleLink] Error in link thread: " + e);
+            }
+            try {
+                Thread.sleep(POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        LOGGER.info("[MumbleLink] Link thread stopped");
+    }
+
+    // -----------------------------------------------------------------------
+
+    private void tick() {
+        tickCount++;
+        lastTickMs = System.currentTimeMillis();
+        Minecraft mc = Minecraft.getMinecraft();
+
+        boolean inWorld = mc != null && mc.thePlayer != null && mc.theWorld != null;
+
+        // ---- Transition: player left world (main menu / disconnect) --------
+        if (!inWorld) {
+            if (wasInWorld) {
+                worldLeaveCount++;
+                if (link != null) {
+                    link.unlink();
+                    link        = null;
+                    lastContext = "";
+                    LOGGER.info("[MumbleLink] Unlinked (left world)");
+                }
+                wasPreviouslyLinked = false;
+            }
+            wasInWorld = false;
+            return;
+        }
+
+        EntityClientPlayerMP player = mc.thePlayer;
+        lastKnownPlayer = player.getCommandSenderName();
+
+        // ---- Transition: player just entered a world -----------------------
+        if (!wasInWorld) {
+            wasInWorld = true;
+            worldJoinCount++;
+            sendWorldJoinBanner(mc);
+        }
+
+        // ---- Drain any queued chat messages --------------------------------
+        drainMessages(player);
+
+        // ---- Open shared memory (retry every tick until Mumble is running) -
+        if (link == null) {
+            linkOpenAttempts++;
+            link = MumbleLink.tryOpen();
+            if (link == null) {
+                LOGGER.fine("[MumbleLink] Waiting for Mumble to start...");
+                return;
+            }
+            // Link just opened.
+            linkOpenSuccesses++;
+            link.init(APP_NAME, APP_DESCRIPTION);
+            lastContext = "";
+            String ctx = buildContext(mc);
+            lastKnownContext = ctx;
+            if (wasPreviouslyLinked) {
+                // Re-established after a drop.
+                enqueue(buildRestoredMessage(ctx, player.getCommandSenderName()));
+                LOGGER.info("[MumbleLink] Link restored – positional audio active");
+            } else {
+                // First time linked since world join.
+                enqueue(buildActiveMessage(ctx, player.getCommandSenderName()));
+                LOGGER.info("[MumbleLink] Linked to Mumble – positional audio active");
+            }
+            wasPreviouslyLinked = true;
+        }
+
+        // ---- Positional data (catch write errors as link-loss) ---------------
+        try {
+            double yawRad   = Math.toRadians(player.rotationYaw);
+            double pitchRad = Math.toRadians(player.rotationPitch);
+
+            float frontX = (float) (-Math.sin(yawRad) * Math.cos(pitchRad));
+            float frontY = (float) (-Math.sin(pitchRad));
+            float frontZ = (float) ( Math.cos(yawRad) * Math.cos(pitchRad));
+            lastPosX = (float) player.posX;
+            lastPosY = (float) (player.posY + player.getEyeHeight());
+            lastPosZ = (float) player.posZ;
+            lastFrontX = frontX;
+            lastFrontY = frontY;
+            lastFrontZ = frontZ;
+
+            link.update(
+                    lastPosX,
+                    lastPosY,
+                    lastPosZ,
+                    frontX, frontY, frontZ);
+
+            // ---- Identity (player name) ------------------------------------
+            link.setIdentity(player.getCommandSenderName());
+
+            // ---- Context (server address; only write and notify on change) -
+            String newCtx = buildContext(mc);
+            if (!newCtx.equals(lastContext)) {
+                byte[] ctxBytes;
+                try {
+                    ctxBytes = newCtx.getBytes("UTF-8");
+                } catch (UnsupportedEncodingException e) {
+                    ctxBytes = newCtx.getBytes();
+                }
+                link.setContext(ctxBytes);
+                lastKnownContext = newCtx;
+
+                // Notify the player about the context change (but suppress the
+                // very first context write that happens right after linking).
+                if (!lastContext.isEmpty()) {
+                    enqueue(buildContextChangedMessage(newCtx));
+                    LOGGER.info("[MumbleLink] Context updated: " + newCtx);
+                }
+                lastContext = newCtx;
+            }
+        } catch (Exception e) {
+            // Write failure means the shared memory is no longer accessible
+            // (e.g. Mumble was closed while the world was loaded).
+            linkWriteFailures++;
+            linkLossCount++;
+            recordError("Link write failure: " + e);
+            LOGGER.warning("[MumbleLink] Link error – shared memory lost: " + e);
+            enqueue(buildInactiveMessage());
+            link        = null;
+            lastContext = "";
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Chat delivery
+    // -----------------------------------------------------------------------
+
+    /** Queues a message for delivery on the next tick. */
+    private void enqueue(String message) {
+        pendingMessages.add(new PendingChatMessage(message, 0));
+    }
+
+    /**
+     * Drains all pending chat messages to the player's chat GUI.
+     * Called each tick when mc.thePlayer is confirmed non-null.
+     */
+    private void drainMessages(EntityClientPlayerMP player) {
+        PendingChatMessage pending;
+        while ((pending = pendingMessages.poll()) != null) {
+            try {
+                sendChatMessage(player, pending.text);
+                chatSentCount++;
+            } catch (Exception e) {
+                chatSendFailures++;
+                recordError("Chat delivery failure: " + e);
+                LOGGER.fine("[MumbleLink] Could not send chat message: " + e);
+                int nextAttempt = pending.attempts + 1;
+                if (nextAttempt <= MAX_CHAT_RETRIES) {
+                    chatRetryCount++;
+                    pendingMessages.add(new PendingChatMessage(pending.text, nextAttempt));
+                }
+            }
+        }
+    }
+
+    /**
+     * Sends one chat message to the player without hard-linking against a
+     * specific Minecraft chat-component class.
+     *
+     * <p>MC 1.6.4 and 1.7+ differ in addChatMessage signatures:
+     * <ul>
+     *   <li>1.6.4: addChatMessage(String) or addChatMessage(ChatMessageComponent)</li>
+     *   <li>1.7+:  addChatMessage(IChatComponent)</li>
+     * </ul>
+     * This method resolves the parameter type at runtime and builds the
+     * appropriate argument reflectively, preventing NoClassDefFoundError on
+     * 1.6.4.
+     */
+    private void sendChatMessage(EntityClientPlayerMP player, String msg) throws Exception {
+        Method addChat = cachedAddChatMethod;
+        if (addChat == null) {
+            addChat = resolveAddChatMethod(player.getClass(), "addChatMessage", "func_145747_a");
+            cachedAddChatMethod = addChat;
+        }
+        if (addChat != null) {
+            Class<?> paramType = addChat.getParameterTypes()[0];
+            Object arg = buildChatArgument(paramType, msg);
+            addChat.invoke(player, arg);
+            chatDeliveryMode = "player:" + addChat.getName() + "(" + paramType.getSimpleName() + ")";
+            return;
+        }
+
+        // Fallback to client chat GUI print path for environments where player
+        // chat methods are unavailable/mapped differently.
+        if (tryGuiPrint(player, msg)) {
+            return;
+        }
+        throw new NoSuchMethodException("Chat delivery method not found on " + player.getClass());
+    }
+
+    /** Finds addChatMessage with exactly one parameter on the runtime player class. */
+    private static Method resolveAddChatMethod(Class<?> playerClass, String nameA, String nameB) {
+        Method[] methods = playerClass.getMethods();
+        for (Method m : methods) {
+            if ((nameA.equals(m.getName()) || nameB.equals(m.getName()))
+                    && m.getParameterTypes().length == 1) {
+                m.setAccessible(true);
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /** Attempts GUI chat print fallback paths used by MC 1.6.4 variants. */
+    private boolean tryGuiPrint(EntityClientPlayerMP player, String msg) {
+        try {
+            Minecraft mc = Minecraft.getMinecraft();
+            if (mc == null) return false;
+            Object gui = mc.ingameGUI;
+            if (gui == null) return false;
+
+            Method print = cachedGuiPrintMethod;
+            if (print == null) {
+                print = resolveGuiPrintMethod(gui.getClass());
+                cachedGuiPrintMethod = print;
+            }
+            if (print == null) return false;
+
+            Class<?> paramType = print.getParameterTypes()[0];
+            Object arg = buildChatArgument(paramType, msg);
+            print.invoke(gui, arg);
+            chatDeliveryMode = "gui:" + print.getName() + "(" + paramType.getSimpleName() + ")";
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Method resolveGuiPrintMethod(Class<?> guiClass) {
+        Method[] methods = guiClass.getMethods();
+        for (Method m : methods) {
+            if (m.getParameterTypes().length == 1) {
+                String name = m.getName();
+                if ("printChatMessage".equals(name)
+                        || "func_73827_b".equals(name)
+                        || "addChatMessage".equals(name)) {
+                    m.setAccessible(true);
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Builds an argument compatible with the discovered addChatMessage signature. */
+    private Object buildChatArgument(Class<?> paramType, String msg) throws Exception {
+        if (String.class.equals(paramType)) {
+            return msg;
+        }
+
+        String typeName = paramType.getName();
+
+        // 1.7+ signature: addChatMessage(IChatComponent) with ChatComponentText(String)
+        if ("net.minecraft.util.IChatComponent".equals(typeName)) {
+            Constructor<?> ctor = cachedChatComponentCtor;
+            if (ctor == null) {
+                Class<?> chatTextClass = Class.forName("net.minecraft.util.ChatComponentText");
+                ctor = chatTextClass.getConstructor(String.class);
+                ctor.setAccessible(true);
+                cachedChatComponentCtor = ctor;
+            }
+            return ctor.newInstance(msg);
+        }
+
+        // 1.6.4 variant: addChatMessage(ChatMessageComponent)
+        if ("net.minecraft.util.ChatMessageComponent".equals(typeName)) {
+            try {
+                Method m = paramType.getMethod("createFromText", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Method m = paramType.getMethod("createFromString", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Method m = paramType.getMethod("func_111077_e", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Constructor<?> ctor = paramType.getConstructor(String.class);
+                ctor.setAccessible(true);
+                return ctor.newInstance(msg);
+            } catch (NoSuchMethodException ignored) { }
+        }
+
+        throw new IllegalStateException("Unsupported addChatMessage param type: " + typeName);
+    }
+
+    // -----------------------------------------------------------------------
+    // Message builders
+    // -----------------------------------------------------------------------
+
+    /**
+     * Sends the initial status banner immediately after the player enters a
+     * world, telling them whether Mumble is already linked or still being
+     * searched for.
+     */
+    private void sendWorldJoinBanner(Minecraft mc) {
+        joinBannerCount++;
+        String os    = System.getProperty("os.name", "unknown");
+        String ver   = MumbleLinkMod.VERSION;
+
+        // Line 1: header
+        enqueue(C_GOLD + C_BOLD + "--- MumbleLink v" + ver
+                + " Positional Audio ---" + C_RESET);
+
+        // Line 2: attempt status
+        if (link != null) {
+            // Already linked from a previous world in the same session
+            // (unusual, but handle gracefully).
+            String ctx = buildContext(mc);
+            enqueue(buildActiveMessage(ctx,
+                    mc.thePlayer.getCommandSenderName()));
+        } else {
+            enqueue(PREFIX
+                    + C_YELLOW + "Searching for Mumble..." + C_RESET
+                    + C_GRAY + "  (OS: " + os + ")" + C_RESET);
+            enqueue(C_GRAY
+                    + "  Ensure Mumble is running with the "
+                    + C_WHITE + "Link" + C_GRAY
+                    + " plugin enabled for positional audio." + C_RESET);
+        }
+    }
+
+    /** Builds the "link ACTIVE" message shown when Mumble is first found. */
+    private static String buildActiveMessage(String context, String playerName) {
+        return PREFIX
+                + C_GREEN + C_BOLD + "Positional audio: ACTIVE" + C_RESET + "\n"
+                + C_GRAY  + "  Server: " + C_WHITE + context    + C_RESET
+                + C_GRAY  + "  |  Player: " + C_WHITE + playerName + C_RESET
+                + C_GRAY  + "  |  Protocol: Mumble Link v2" + C_RESET;
+    }
+
+    /** Builds the "link RESTORED" message after Mumble reconnects mid-session. */
+    private static String buildRestoredMessage(String context, String playerName) {
+        return PREFIX
+                + C_GREEN + "Positional audio: RESTORED" + C_RESET + "\n"
+                + C_GRAY  + "  Server: " + C_WHITE + context    + C_RESET
+                + C_GRAY  + "  |  Player: " + C_WHITE + playerName + C_RESET;
+    }
+
+    /** Builds the "link INACTIVE" message when Mumble closes mid-session. */
+    private static String buildInactiveMessage() {
+        return PREFIX
+                + C_RED + "Positional audio: INACTIVE" + C_RESET + "\n"
+                + C_GRAY + "  Mumble closed or Link plugin disabled."
+                + "  Will reconnect automatically." + C_RESET;
+    }
+
+    /** Builds the context-changed update message. */
+    private static String buildContextChangedMessage(String newContext) {
+        return PREFIX
+                + C_GOLD + "Context updated: " + C_WHITE + newContext + C_RESET;
+    }
+
+    // -----------------------------------------------------------------------
+
+    private void recordError(String message) {
+        lastError = message;
+        lastErrorMs = System.currentTimeMillis();
+    }
+
+    /** Exposes command/help prefix for command output. */
+    public String getChatPrefix() {
+        return PREFIX;
+    }
+
+    /** Enqueue any command-generated message for in-game display. */
+    public void enqueueCommandMessage(String message) {
+        enqueue(message);
+    }
+
+    /** Re-displays join status banner for the current world context. */
+    public void resendWorldJoinBanner() {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc != null && mc.thePlayer != null) {
+            sendWorldJoinBanner(mc);
+        } else {
+            enqueue(PREFIX + C_RED + "Cannot show banner: no world loaded." + C_RESET);
+        }
+    }
+
+    /** Forces a reconnect attempt on the next tick. */
+    public synchronized void forceReconnect() {
+        if (link != null) {
+            try {
+                link.unlink();
+            } catch (Exception ignored) { }
+        }
+        link = null;
+        lastContext = "";
+        enqueue(PREFIX + C_YELLOW + "Reconnect requested. Re-opening Mumble link..." + C_RESET);
+    }
+
+    /** Returns a snapshot used by /mumble diagnostics output. */
+    public Snapshot snapshot() {
+        return new Snapshot(
+                threadStartMs,
+                tickCount,
+                worldJoinCount,
+                worldLeaveCount,
+                linkOpenAttempts,
+                linkOpenSuccesses,
+                linkLossCount,
+                linkWriteFailures,
+                link != null,
+                wasInWorld,
+                pendingMessages.size(),
+                chatSentCount,
+                chatSendFailures,
+                chatRetryCount,
+                joinBannerCount,
+                lastTickMs,
+                lastErrorMs,
+                safe(lastError),
+                safe(lastKnownPlayer),
+                safe(lastKnownContext),
+                lastPosX, lastPosY, lastPosZ,
+                lastFrontX, lastFrontY, lastFrontZ,
+                safe(chatDeliveryMode)
+        );
+    }
+
+    private static String safe(String v) {
+        return v == null ? "" : v;
+    }
+
+    /** Immutable diagnostics payload for /mumble. */
+    public static final class Snapshot {
+        public final long threadStartMs;
+        public final long tickCount;
+        public final long worldJoinCount;
+        public final long worldLeaveCount;
+        public final long linkOpenAttempts;
+        public final long linkOpenSuccesses;
+        public final long linkLossCount;
+        public final long linkWriteFailures;
+        public final boolean linkActive;
+        public final boolean inWorld;
+        public final int pendingMessages;
+        public final long chatSentCount;
+        public final long chatSendFailures;
+        public final long chatRetryCount;
+        public final long joinBannerCount;
+        public final long lastTickMs;
+        public final long lastErrorMs;
+        public final String lastError;
+        public final String lastKnownPlayer;
+        public final String lastKnownContext;
+        public final float lastPosX, lastPosY, lastPosZ;
+        public final float lastFrontX, lastFrontY, lastFrontZ;
+        public final String chatDeliveryMode;
+
+        private Snapshot(long threadStartMs, long tickCount, long worldJoinCount,
+                         long worldLeaveCount, long linkOpenAttempts, long linkOpenSuccesses,
+                         long linkLossCount, long linkWriteFailures, boolean linkActive,
+                         boolean inWorld, int pendingMessages, long chatSentCount,
+                         long chatSendFailures, long chatRetryCount, long joinBannerCount,
+                         long lastTickMs, long lastErrorMs, String lastError,
+                         String lastKnownPlayer, String lastKnownContext,
+                         float lastPosX, float lastPosY, float lastPosZ,
+                         float lastFrontX, float lastFrontY, float lastFrontZ,
+                         String chatDeliveryMode) {
+            this.threadStartMs = threadStartMs;
+            this.tickCount = tickCount;
+            this.worldJoinCount = worldJoinCount;
+            this.worldLeaveCount = worldLeaveCount;
+            this.linkOpenAttempts = linkOpenAttempts;
+            this.linkOpenSuccesses = linkOpenSuccesses;
+            this.linkLossCount = linkLossCount;
+            this.linkWriteFailures = linkWriteFailures;
+            this.linkActive = linkActive;
+            this.inWorld = inWorld;
+            this.pendingMessages = pendingMessages;
+            this.chatSentCount = chatSentCount;
+            this.chatSendFailures = chatSendFailures;
+            this.chatRetryCount = chatRetryCount;
+            this.joinBannerCount = joinBannerCount;
+            this.lastTickMs = lastTickMs;
+            this.lastErrorMs = lastErrorMs;
+            this.lastError = lastError;
+            this.lastKnownPlayer = lastKnownPlayer;
+            this.lastKnownContext = lastKnownContext;
+            this.lastPosX = lastPosX;
+            this.lastPosY = lastPosY;
+            this.lastPosZ = lastPosZ;
+            this.lastFrontX = lastFrontX;
+            this.lastFrontY = lastFrontY;
+            this.lastFrontZ = lastFrontZ;
+            this.chatDeliveryMode = chatDeliveryMode;
+        }
+
+        public List<String> toDiagnosticLines() {
+            List<String> out = new ArrayList<String>();
+            out.add("Thread start ms: " + threadStartMs + " | last tick ms: " + lastTickMs + " | ticks: " + tickCount);
+            out.add("World state: inWorld=" + inWorld + " joins=" + worldJoinCount + " leaves=" + worldLeaveCount);
+            out.add("Link state: active=" + linkActive + " openAttempts=" + linkOpenAttempts + " openSuccesses=" + linkOpenSuccesses + " losses=" + linkLossCount);
+            out.add("Context: " + lastKnownContext + " | player: " + lastKnownPlayer);
+            out.add("Position: [" + lastPosX + ", " + lastPosY + ", " + lastPosZ + "] front=[" + lastFrontX + ", " + lastFrontY + ", " + lastFrontZ + "]");
+            out.add("Chat: sent=" + chatSentCount + " failures=" + chatSendFailures + " retries=" + chatRetryCount + " pending=" + pendingMessages + " mode=" + chatDeliveryMode);
+            out.add("Banners shown: " + joinBannerCount + " | write failures: " + linkWriteFailures);
+            if (lastError != null && lastError.length() > 0) {
+                out.add("Last error@" + lastErrorMs + ": " + lastError);
+            } else {
+                out.add("Last error: none");
+            }
+            return out;
+        }
+    }
+
+    private static String buildContext(Minecraft mc) {
+        try {
+            if (mc.getCurrentServerData() != null) {
+                return "mumblelink|" + mc.getCurrentServerData().serverIP;
+            }
+            if (mc.isIntegratedServerRunning()) {
+                return "mumblelink|singleplayer";
+            }
+        } catch (Exception e) {
+            LOGGER.fine("[MumbleLink] Could not determine context: " + e);
+        }
+        return "mumblelink|unknown";
+    }
+}

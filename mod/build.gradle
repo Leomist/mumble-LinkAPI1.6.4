@@ -1,0 +1,82 @@
+/*
+ * Build script for mumblelink-1.6.4.
+ *
+ * Normal usage (when network access to ForgeGradle is available):
+ *   ./gradlew build
+ *
+ * The resulting mod JAR is placed in build/libs/ and also copied to
+ * release/mumblelink-1.6.4.jar.
+ *
+ * The release/ directory also contains a pre-compiled JAR that can be
+ * used directly if Gradle/ForgeGradle is unavailable.
+ */
+plugins {
+    id 'java'
+}
+
+group   = 'zsawyer.mods'
+version = '1.1.4'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_7
+    targetCompatibility = JavaVersion.VERSION_1_7
+}
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = [
+                'src/main/java',
+                // Include the existing JNA wrapper sources
+                '../tests/java/src'
+            ]
+        }
+        resources {
+            srcDirs = ['src/main/resources']
+        }
+    }
+}
+
+// JNA 4.x is available as a bundled jar; reference it directly.
+dependencies {
+    compileOnly fileTree(dir: '../tests/java/lib', include: ['jna-4.0.0.jar'])
+    // Forge / Minecraft APIs are provided at runtime; stubs are not needed
+    // when the project is set up with ForgeGradle.
+}
+
+jar {
+    archiveBaseName = 'mumblelink'
+    archiveVersion  = '1.6.4'
+    archiveClassifier = ''
+
+    // Bundle JNA classes so the mod is self-contained (no separate JNA mod needed)
+    from(zipTree('../tests/java/lib/jna-4.0.0.jar')) {
+        exclude 'META-INF/**'
+    }
+
+    // Bundle native libraries
+    into('native/windows/x86')   { from '../ide/scripts/build/libLinkAPI.dll';   rename 'libLinkAPI.dll', 'LinkAPI.dll' }
+    into('native/windows/amd64') { from '../ide/scripts/build/libLinkAPI64.dll'; rename 'libLinkAPI64.dll', 'LinkAPI.dll' }
+    // Linux SO is built by the make.sh script; include if present
+    into('native/linux/amd64')   { from(fileTree(dir: '../ide/scripts/build', include: 'libLinkAPI.so')) }
+
+    manifest {
+        attributes(
+            'Implementation-Title':   'MumbleLink',
+            'Implementation-Version': '1.1.4',
+            'FMLCorePlugin':          '',
+            'FMLCorePluginContainsFMLMod': 'true'
+        )
+    }
+}
+
+// Copy the finished JAR into the release directory
+task copyRelease(type: Copy, dependsOn: jar) {
+    from jar.archiveFile
+    into '../release'
+}
+build.finalizedBy copyRelease

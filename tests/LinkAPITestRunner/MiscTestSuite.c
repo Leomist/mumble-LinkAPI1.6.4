@@ -172,6 +172,32 @@ void TestMiscSuite_getContextNullAndExtendedMaxLengthTolerance(CuTest* tc) {
 	CuAssertCharArrayEquals(tc, text, actual, cutLength);
 }
 
+void TestMiscSuite_initializeAlwaysRefreshesNameAndDescription(CuTest* tc) {
+	wchar_t initialName[LINKAPI_MAX_NAME_LENGTH] = L"InitialName\0";
+	wchar_t initialDescription[LINKAPI_MAX_DESCRIPTION_LENGTH] = L"InitialDescription\0";
+	wchar_t refreshedName[LINKAPI_MAX_NAME_LENGTH] = L"RefreshedName\0";
+	wchar_t refreshedDescription[LINKAPI_MAX_DESCRIPTION_LENGTH] = L"RefreshedDescription\0";
+	LINKAPI_NATIVE_UINT32 version = 5;
+
+	LINKAPI_ERROR_CODE err = initialize(initialName, initialDescription, version);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+	err = initialize(refreshedName, refreshedDescription, version);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+
+	wchar_t actualName[LINKAPI_MAX_NAME_LENGTH];
+	wchar_t actualDescription[LINKAPI_MAX_DESCRIPTION_LENGTH];
+	memset(&actualName, 0, sizeof actualName);
+	memset(&actualDescription, 0, sizeof actualDescription);
+
+	err = getName(actualName);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+	err = getDescription(actualDescription);
+	CuAssertIntEquals(tc, LINKAPI_ERROR_CODE_NO_ERROR, err);
+
+	CuAssertWCharTArrayEquals(tc, refreshedName, actualName, LINKAPI_MAX_NAME_LENGTH);
+	CuAssertWCharTArrayEquals(tc, refreshedDescription, actualDescription, LINKAPI_MAX_DESCRIPTION_LENGTH);
+}
+
 // TODO: test function that verifies that name, description and version are restored to the last values set before a relock (especially with setData)
 
 /*
@@ -184,7 +210,9 @@ void TestMiscSuite_getContextNullAndExtendedMaxLengthTolerance(CuTest* tc) {
 CuSuite* MiscSuite(void) {
 	CuSuite* suite = CuSuiteNew();
 
-	LINKAPI_ERROR_CODE initError = initialize((wchar_t*) "TestName\0", (wchar_t*) "TestDescription\0", INITIAL_UI_VERSION);
+	wchar_t name[LINKAPI_MAX_NAME_LENGTH] = L"TestName\0";
+	wchar_t description[LINKAPI_MAX_DESCRIPTION_LENGTH] = L"TestDescription\0";
+	LINKAPI_ERROR_CODE initError = initialize(name, description, INITIAL_UI_VERSION);
 	if (initError == LINKAPI_ERROR_CODE_NO_ERROR) {
 
 		SUITE_ADD_TEST(suite, TestMiscSuite_frameworkSetupLM);
@@ -193,6 +221,7 @@ CuSuite* MiscSuite(void) {
 		SUITE_ADD_TEST(suite, TestMiscSuite_commit);
 		SUITE_ADD_TEST(suite, TestMiscSuite_initializeMultipleTimes);
 		SUITE_ADD_TEST(suite, TestMiscSuite_getContextNullAndExtendedMaxLengthTolerance);
+		SUITE_ADD_TEST(suite, TestMiscSuite_initializeAlwaysRefreshesNameAndDescription);
 
 
 	} else {
