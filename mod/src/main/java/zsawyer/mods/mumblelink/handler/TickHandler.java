@@ -21,25 +21,25 @@ package zsawyer.mods.mumblelink.handler;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityClientPlayerMP;
-import zsawyer.mumble.jna.LinkAPILibrary;
+import zsawyer.mods.mumblelink.MumbleLink;
 
-import java.util.Arrays;
+import java.io.UnsupportedEncodingException;
 import java.util.logging.Logger;
 
 /**
  * Background daemon thread that keeps Mumble's shared-memory link alive while
  * Minecraft is running a world.
  *
- * <p>This implementation polls Minecraft state every {@value #POLL_MS} ms so
- * that it works regardless of which Forge / FML event-bus API variant is
- * present at runtime.  The Mumble Link protocol requires position updates at
- * roughly 20 Hz (50 ms), so polling at 50 ms is sufficient.
+ * <p>This implementation polls Minecraft state every {@value #POLL_MS} ms and
+ * writes positional audio data directly to Mumble's shared-memory segment via
+ * {@link MumbleLink}.  It does not depend on any intermediate native helper
+ * library (DLL/SO).
  *
  * <p>Coordinate mapping:
  * <ul>
- *   <li>Minecraft X (East +)  → Mumble X</li>
- *   <li>Minecraft Y (Up +)    → Mumble Y</li>
- *   <li>Minecraft Z (South +) → Mumble Z</li>
+ *   <li>Minecraft X (East +)   → Mumble X</li>
+ *   <li>Minecraft Y (Up +)     → Mumble Y</li>
+ *   <li>Minecraft Z (South +)  → Mumble Z</li>
  * </ul>
  */
 public final class TickHandler implements Runnable {
@@ -49,17 +49,14 @@ public final class TickHandler implements Runnable {
     private static final String APP_NAME        = "Minecraft";
     private static final String APP_DESCRIPTION = "Minecraft 1.6.4 MumbleLink positional audio";
 
-    /** Poll interval in milliseconds – 50 ms ≈ 20 Hz, the rate Mumble expects. */
+    /** Poll interval in milliseconds – 50 ms = 20 Hz, the rate Mumble expects. */
     private static final long POLL_MS = 50L;
 
-    private final LinkAPILibrary api;
+    /** Live link to Mumble shared memory; null when not yet opened. */
+    private MumbleLink link = null;
 
-    private boolean linked      = false;
-    private String  lastContext = "";
-
-    public TickHandler(LinkAPILibrary api) {
-        this.api = api;
-    }
+    /** Cached context string to avoid writing on every tick. */
+    private String lastContext = "";
 
     // -----------------------------------------------------------------------
     // Runnable
@@ -88,76 +85,63 @@ public final class TickHandler implements Runnable {
 
     private void tick() {
         Minecraft mc = Minecraft.getMinecraft();
+
+        // Unlink if no world is loaded (main menu, loading screen, etc.)
         if (mc == null || mc.thePlayer == null || mc.theWorld == null) {
-            if (linked) {
-                try {
-                    api.unlinkMumble();
-                } catch (Exception e) {
-                    LOGGER.fine("[MumbleLink] unlinkMumble error: " + e);
-                }
-                linked      = false;
+            if (link != null) {
+                link.unlink();
+                link        = null;
                 lastContext = "";
                 LOGGER.info("[MumbleLink] Unlinked from Mumble (no active world)");
             }
             return;
         }
 
-        if (!linked) {
-            char[] name = toCharArray(APP_NAME, LinkAPILibrary.LINKAPI_MAX_NAME_LENGTH);
-            char[] desc = toCharArray(APP_DESCRIPTION,
-                    LinkAPILibrary.LINKAPI_MAX_DESCRIPTION_LENGTH);
-            int err = api.initialize(name, desc, 2);
-            if (err == LinkAPILibrary.LINKAPI_ERROR_CODE.LINKAPI_ERROR_CODE_NO_ERROR) {
-                linked = true;
-                LOGGER.info("[MumbleLink] Linked to Mumble – positional audio active");
-            } else {
-                // Mumble not running yet – log at FINE to avoid log spam.
-                LOGGER.fine("[MumbleLink] Waiting for Mumble Link"
-                        + " (initialize returned " + err + ")");
+        // Open shared memory if not yet connected (retried every poll until
+        // Mumble starts and creates the segment).
+        if (link == null) {
+            link = MumbleLink.tryOpen();
+            if (link == null) {
+                // Mumble not running yet; suppress spam by logging at FINE.
+                LOGGER.fine("[MumbleLink] Waiting for Mumble to start...");
+                return;
             }
-            return;
+            link.init(APP_NAME, APP_DESCRIPTION);
+            LOGGER.info("[MumbleLink] Linked to Mumble – positional audio active");
+            lastContext = "";
         }
 
+        // ---- Positional data -----------------------------------------------
         EntityClientPlayerMP player = mc.thePlayer;
 
-        // ---- Position (eye position in metres / blocks) ------------------
-        float[] pos = {
-            (float)  player.posX,
-            (float) (player.posY + player.getEyeHeight()),
-            (float)  player.posZ
-        };
-
-        // ---- Look vector from yaw / pitch --------------------------------
-        // MC yaw:   0 = South (+Z), 90 = West (-X), clockwise looking down.
-        // MC pitch: positive = looking down, negative = looking up.
         double yawRad   = Math.toRadians(player.rotationYaw);
         double pitchRad = Math.toRadians(player.rotationPitch);
 
-        float[] front = {
-            (float) (-Math.sin(yawRad) * Math.cos(pitchRad)),
-            (float) (-Math.sin(pitchRad)),
-            (float) ( Math.cos(yawRad) * Math.cos(pitchRad))
-        };
-        float[] top = { 0f, 1f, 0f };
+        // MC yaw 0 = South (+Z), increases clockwise when viewed from above.
+        // MC pitch > 0 = looking down; < 0 = looking up.
+        float frontX = (float) (-Math.sin(yawRad) * Math.cos(pitchRad));
+        float frontY = (float) (-Math.sin(pitchRad));
+        float frontZ = (float) ( Math.cos(yawRad) * Math.cos(pitchRad));
 
-        api.commitVectorsAvatarAsCamera(pos, front, top);
+        link.update(
+                (float)  player.posX,
+                (float) (player.posY + player.getEyeHeight()),
+                (float)  player.posZ,
+                frontX, frontY, frontZ);
 
-        // ---- Identity (player name) --------------------------------------
-        api.commitIdentity(
-                toCharArray(player.getCommandSenderName(),
-                        LinkAPILibrary.LINKAPI_MAX_IDENTITY_LENGTH));
+        // ---- Identity (player name) ----------------------------------------
+        link.setIdentity(player.getCommandSenderName());
 
-        // ---- Context (server address – controls who hears positional audio)
+        // ---- Context (server address; only write on change) ----------------
         String newCtx = buildContext(mc);
         if (!newCtx.equals(lastContext)) {
             byte[] ctxBytes;
             try {
                 ctxBytes = newCtx.getBytes("UTF-8");
-            } catch (java.io.UnsupportedEncodingException e) {
+            } catch (UnsupportedEncodingException e) {
                 ctxBytes = newCtx.getBytes();
             }
-            int len = Math.min(ctxBytes.length, LinkAPILibrary.LINKAPI_MAX_CONTEXT_LENGTH);
-            api.commitContext(Arrays.copyOf(ctxBytes, len), len);
+            link.setContext(ctxBytes);
             lastContext = newCtx;
         }
     }
@@ -177,15 +161,5 @@ public final class TickHandler implements Runnable {
         }
         return "mumblelink|unknown";
     }
-
-    /**
-     * Converts a String to a null-padded {@code char[]} of length {@code maxLen}.
-     * The result is guaranteed to be null-terminated.
-     */
-    private static char[] toCharArray(String s, int maxLen) {
-        char[] arr = new char[maxLen];
-        int copy = Math.min(s.length(), maxLen - 1);
-        s.getChars(0, copy, arr, 0);
-        return arr;
-    }
 }
+

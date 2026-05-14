@@ -21,24 +21,17 @@ package zsawyer.mods.mumblelink;
 
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
-import cpw.mods.fml.common.event.FMLPreInitializationEvent;
-import com.sun.jna.Native;
 import zsawyer.mods.mumblelink.handler.TickHandler;
-import zsawyer.mods.mumblelink.util.NativeLoader;
-import zsawyer.mumble.jna.LinkAPILibrary;
 
 import java.util.logging.Logger;
 
 /**
  * Main Forge mod class for MumbleLink.
  *
- * <p>Lifecycle:
- * <ol>
- *   <li>{@link #preInit} – extracts the native LinkAPI library from the JAR and
- *       sets {@code jna.library.path} so JNA can find it.</li>
- *   <li>{@link #init}    – loads the JNA wrapper and registers the per-tick
- *       handler that pipes player position to Mumble.</li>
- * </ol>
+ * <p>On {@link #init}, starts a background daemon thread that polls Minecraft
+ * state at 20 Hz and writes positional audio data directly to Mumble's
+ * shared-memory segment (via {@link MumbleLink}).  No intermediate native
+ * helper library is required.
  *
  * <p>Drop {@code mumblelink-1.6.4.jar} into the {@code mods/} folder of a
  * Minecraft 1.6.4 + Forge installation.  Mumble must be running with the
@@ -54,59 +47,26 @@ public final class MumbleLinkMod {
 
     public static final String MODID   = "mumblelink";
     public static final String NAME    = "MumbleLink";
-    public static final String VERSION = "1.1.2";
+    public static final String VERSION = "1.1.3";
 
     @Mod.Instance(MODID)
     public static MumbleLinkMod INSTANCE;
 
     private static final Logger LOGGER = Logger.getLogger(MODID);
 
-    /** Set during {@link #init} after the native library is loaded. */
-    private LinkAPILibrary api;
-
-    // -----------------------------------------------------------------------
-    // FML lifecycle
-    // -----------------------------------------------------------------------
-
     /**
-     * Pre-initialisation: extract the native library from the mod JAR so it
-     * is available on the file system before JNA tries to load it.
-     */
-    @Mod.EventHandler
-    public void preInit(FMLPreInitializationEvent event) {
-        LOGGER.info("[MumbleLink] Pre-initialising " + NAME + " " + VERSION);
-        try {
-            NativeLoader.extractAndLoad();
-        } catch (Exception e) {
-            LOGGER.severe("[MumbleLink] Failed to extract native library: "
-                    + e.getMessage());
-        }
-    }
-
-    /**
-     * Initialisation: load the JNA wrapper and start the background link thread.
+     * Initialisation: start the background Mumble link thread.
      *
-     * <p>Using a background daemon thread instead of the FML event bus ensures
-     * compatibility across all 1.6.4 Forge builds regardless of which EventBus
-     * API variant (FML's own EventBus vs Guava EventBus) is present at runtime.
-     * The thread polls Minecraft state at ~20 Hz, which is the rate Mumble's
-     * Link plugin expects.
+     * <p>The thread opens Mumble's shared memory directly via JNA (no
+     * external DLL needed) and retries every 50 ms until Mumble is running.
      */
     @Mod.EventHandler
-    @SuppressWarnings("unchecked")
     public void init(FMLInitializationEvent event) {
         LOGGER.info("[MumbleLink] Initialising " + NAME + " " + VERSION);
-        try {
-            api = (LinkAPILibrary) Native.loadLibrary(
-                    "LinkAPI", LinkAPILibrary.class);
-            Thread t = new Thread(new TickHandler(api), "MumbleLink");
-            t.setDaemon(true);
-            t.start();
-            LOGGER.info("[MumbleLink] Initialised successfully – "
-                    + "link thread started");
-        } catch (Exception e) {
-            LOGGER.severe("[MumbleLink] Initialisation failed: "
-                    + e.getMessage());
-        }
+        Thread t = new Thread(new TickHandler(), "MumbleLink");
+        t.setDaemon(true);
+        t.start();
+        LOGGER.info("[MumbleLink] Link thread started – waiting for Mumble");
     }
 }
+
