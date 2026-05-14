@@ -21,11 +21,12 @@ package zsawyer.mods.mumblelink.handler;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityClientPlayerMP;
-import net.minecraft.util.ChatComponentText;
 import zsawyer.mods.mumblelink.MumbleLink;
 import zsawyer.mods.mumblelink.MumbleLinkMod;
 
 import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.logging.Logger;
 
@@ -102,6 +103,12 @@ public final class TickHandler implements Runnable {
      */
     private final ConcurrentLinkedQueue<String> pendingMessages =
             new ConcurrentLinkedQueue<String>();
+
+    /** Cached reflective method for player chat delivery. */
+    private transient Method cachedAddChatMethod = null;
+
+    /** Cached constructor for net.minecraft.util.ChatComponentText(String). */
+    private transient Constructor<?> cachedChatComponentCtor = null;
 
     // -----------------------------------------------------------------------
     // Runnable
@@ -246,11 +253,95 @@ public final class TickHandler implements Runnable {
         String msg;
         while ((msg = pendingMessages.poll()) != null) {
             try {
-                player.addChatMessage(new ChatComponentText(msg));
+                sendChatMessage(player, msg);
             } catch (Exception e) {
                 LOGGER.fine("[MumbleLink] Could not send chat message: " + e);
             }
         }
+    }
+
+    /**
+     * Sends one chat message to the player without hard-linking against a
+     * specific Minecraft chat-component class.
+     *
+     * <p>MC 1.6.4 and 1.7+ differ in addChatMessage signatures:
+     * <ul>
+     *   <li>1.6.4: addChatMessage(String) or addChatMessage(ChatMessageComponent)</li>
+     *   <li>1.7+:  addChatMessage(IChatComponent)</li>
+     * </ul>
+     * This method resolves the parameter type at runtime and builds the
+     * appropriate argument reflectively, preventing NoClassDefFoundError on
+     * 1.6.4.
+     */
+    private void sendChatMessage(EntityClientPlayerMP player, String msg) throws Exception {
+        Method addChat = cachedAddChatMethod;
+        if (addChat == null) {
+            addChat = resolveAddChatMethod(player.getClass());
+            cachedAddChatMethod = addChat;
+        }
+        if (addChat == null) {
+            throw new NoSuchMethodException("addChatMessage(*) not found on " + player.getClass());
+        }
+
+        Class<?> paramType = addChat.getParameterTypes()[0];
+        Object arg = buildChatArgument(paramType, msg);
+        addChat.invoke(player, arg);
+    }
+
+    /** Finds addChatMessage with exactly one parameter on the runtime player class. */
+    private static Method resolveAddChatMethod(Class<?> playerClass) {
+        Method[] methods = playerClass.getMethods();
+        for (Method m : methods) {
+            if ("addChatMessage".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                m.setAccessible(true);
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /** Builds an argument compatible with the discovered addChatMessage signature. */
+    private Object buildChatArgument(Class<?> paramType, String msg) throws Exception {
+        if (String.class.equals(paramType)) {
+            return msg;
+        }
+
+        String typeName = paramType.getName();
+
+        // 1.7+ signature: addChatMessage(IChatComponent) with ChatComponentText(String)
+        if ("net.minecraft.util.IChatComponent".equals(typeName)) {
+            Constructor<?> ctor = cachedChatComponentCtor;
+            if (ctor == null) {
+                Class<?> chatTextClass = Class.forName("net.minecraft.util.ChatComponentText");
+                ctor = chatTextClass.getConstructor(String.class);
+                ctor.setAccessible(true);
+                cachedChatComponentCtor = ctor;
+            }
+            return ctor.newInstance(msg);
+        }
+
+        // 1.6.4 variant: addChatMessage(ChatMessageComponent)
+        if ("net.minecraft.util.ChatMessageComponent".equals(typeName)) {
+            try {
+                Method m = paramType.getMethod("createFromText", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Method m = paramType.getMethod("createFromString", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Method m = paramType.getMethod("func_111077_e", String.class);
+                return m.invoke(null, msg);
+            } catch (NoSuchMethodException ignored) { }
+            try {
+                Constructor<?> ctor = paramType.getConstructor(String.class);
+                ctor.setAccessible(true);
+                return ctor.newInstance(msg);
+            } catch (NoSuchMethodException ignored) { }
+        }
+
+        throw new IllegalStateException("Unsupported addChatMessage param type: " + typeName);
     }
 
     // -----------------------------------------------------------------------
@@ -335,4 +426,3 @@ public final class TickHandler implements Runnable {
         return "mumblelink|unknown";
     }
 }
-
