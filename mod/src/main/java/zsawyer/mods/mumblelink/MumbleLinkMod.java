@@ -19,8 +19,10 @@
  */
 package zsawyer.mods.mumblelink;
 
+import cpw.mods.fml.client.ClientCommandHandler;
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
+import zsawyer.mods.mumblelink.command.MumbleCommand;
 import zsawyer.mods.mumblelink.handler.TickHandler;
 
 import java.util.logging.Logger;
@@ -53,6 +55,7 @@ public final class MumbleLinkMod {
     public static MumbleLinkMod INSTANCE;
 
     private static final Logger LOGGER = Logger.getLogger(MODID);
+    private static TickHandler tickHandler;
 
     /**
      * Initialisation: start the background Mumble link thread.
@@ -63,10 +66,20 @@ public final class MumbleLinkMod {
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
         LOGGER.info("[MumbleLink] Initialising " + NAME + " " + VERSION);
-        Thread t = new Thread(new TickHandler(), "MumbleLink");
+        tickHandler = new TickHandler();
+        Thread t = new Thread(tickHandler, "MumbleLink");
         t.setDaemon(true);
         t.start();
+        try {
+            ClientCommandHandler.instance.registerCommand(new MumbleCommand());
+            LOGGER.info("[MumbleLink] Registered client command: /mumble");
+        } catch (Throwable commandError) {
+            LOGGER.warning("[MumbleLink] Could not register /mumble command: " + commandError);
+        }
         LOGGER.info("[MumbleLink] Link thread started – waiting for Mumble");
     }
-}
 
+    public static TickHandler getTickHandler() {
+        return tickHandler;
+    }
+}

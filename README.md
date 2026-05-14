@@ -28,6 +28,16 @@ Changelog:
   - context change (different server within same session): gold update message
 - chat messages are queued via ConcurrentLinkedQueue and delivered safely from
   the background polling thread via mc.thePlayer.addChatMessage()
+- improve MC 1.6.4 chat reliability:
+  - retry failed chat deliveries instead of dropping join/status lines
+  - add fallback GUI chat print path for environments where mapped player chat
+    method names differ
+- add client command `/mumble` with tab completion and diagnostics:
+  - `/mumble help` lists all available options
+  - `/mumble status|values|stats|checks|diag|all` displays live API/link data
+  - `/mumble banner` re-displays join banner
+  - `/mumble reconnect` forces link re-open
+  - `/mumble test [text]` queues a chat pipeline test message
 
 - eliminate intermediate native DLL entirely:
   - implement Mumble Link shared-memory protocol directly in Java via JNA

@@ -27,6 +27,8 @@ import zsawyer.mods.mumblelink.MumbleLinkMod;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.logging.Logger;
 
@@ -101,8 +103,8 @@ public final class TickHandler implements Runnable {
      * Messages are enqueued by state-transition logic and dequeued each
      * tick when mc.thePlayer is available.
      */
-    private final ConcurrentLinkedQueue<String> pendingMessages =
-            new ConcurrentLinkedQueue<String>();
+    private final ConcurrentLinkedQueue<PendingChatMessage> pendingMessages =
+            new ConcurrentLinkedQueue<PendingChatMessage>();
 
     /** Cached reflective method for player chat delivery. */
     private transient Method cachedAddChatMethod = null;
@@ -110,17 +112,61 @@ public final class TickHandler implements Runnable {
     /** Cached constructor for net.minecraft.util.ChatComponentText(String). */
     private transient Constructor<?> cachedChatComponentCtor = null;
 
+    /** Cached reflective fallback for gui chat print methods. */
+    private transient Method cachedGuiPrintMethod = null;
+
+    /** Runtime stats for /mumble diagnostics. */
+    private volatile long threadStartMs       = 0L;
+    private volatile long tickCount           = 0L;
+    private volatile long worldJoinCount      = 0L;
+    private volatile long worldLeaveCount     = 0L;
+    private volatile long linkOpenAttempts    = 0L;
+    private volatile long linkOpenSuccesses   = 0L;
+    private volatile long linkLossCount       = 0L;
+    private volatile long linkWriteFailures   = 0L;
+    private volatile long chatSentCount       = 0L;
+    private volatile long chatSendFailures    = 0L;
+    private volatile long chatRetryCount      = 0L;
+    private volatile long joinBannerCount     = 0L;
+    private volatile long lastTickMs          = 0L;
+    private volatile long lastErrorMs         = 0L;
+    private volatile String lastError         = "";
+    private volatile String lastKnownPlayer   = "";
+    private volatile String lastKnownContext  = "mumblelink|unknown";
+    private volatile float lastPosX           = 0f;
+    private volatile float lastPosY           = 0f;
+    private volatile float lastPosZ           = 0f;
+    private volatile float lastFrontX         = 0f;
+    private volatile float lastFrontY         = 0f;
+    private volatile float lastFrontZ         = 0f;
+    private volatile String chatDeliveryMode  = "unresolved";
+
+    private static final int MAX_CHAT_RETRIES = 5;
+
+    /** Queue payload with retry count so failed sends are not dropped. */
+    private static final class PendingChatMessage {
+        private final String text;
+        private final int attempts;
+
+        private PendingChatMessage(String text, int attempts) {
+            this.text = text;
+            this.attempts = attempts;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Runnable
     // -----------------------------------------------------------------------
 
     @Override
     public void run() {
+        threadStartMs = System.currentTimeMillis();
         LOGGER.info("[MumbleLink] Link thread started");
         while (!Thread.currentThread().isInterrupted()) {
             try {
                 tick();
             } catch (Exception e) {
+                recordError("Tick loop error: " + e);
                 LOGGER.warning("[MumbleLink] Error in link thread: " + e);
             }
             try {
@@ -136,6 +182,8 @@ public final class TickHandler implements Runnable {
     // -----------------------------------------------------------------------
 
     private void tick() {
+        tickCount++;
+        lastTickMs = System.currentTimeMillis();
         Minecraft mc = Minecraft.getMinecraft();
 
         boolean inWorld = mc != null && mc.thePlayer != null && mc.theWorld != null;
@@ -143,6 +191,7 @@ public final class TickHandler implements Runnable {
         // ---- Transition: player left world (main menu / disconnect) --------
         if (!inWorld) {
             if (wasInWorld) {
+                worldLeaveCount++;
                 if (link != null) {
                     link.unlink();
                     link        = null;
@@ -156,10 +205,12 @@ public final class TickHandler implements Runnable {
         }
 
         EntityClientPlayerMP player = mc.thePlayer;
+        lastKnownPlayer = player.getCommandSenderName();
 
         // ---- Transition: player just entered a world -----------------------
         if (!wasInWorld) {
             wasInWorld = true;
+            worldJoinCount++;
             sendWorldJoinBanner(mc);
         }
 
@@ -168,15 +219,18 @@ public final class TickHandler implements Runnable {
 
         // ---- Open shared memory (retry every tick until Mumble is running) -
         if (link == null) {
+            linkOpenAttempts++;
             link = MumbleLink.tryOpen();
             if (link == null) {
                 LOGGER.fine("[MumbleLink] Waiting for Mumble to start...");
                 return;
             }
             // Link just opened.
+            linkOpenSuccesses++;
             link.init(APP_NAME, APP_DESCRIPTION);
             lastContext = "";
             String ctx = buildContext(mc);
+            lastKnownContext = ctx;
             if (wasPreviouslyLinked) {
                 // Re-established after a drop.
                 enqueue(buildRestoredMessage(ctx, player.getCommandSenderName()));
@@ -197,11 +251,17 @@ public final class TickHandler implements Runnable {
             float frontX = (float) (-Math.sin(yawRad) * Math.cos(pitchRad));
             float frontY = (float) (-Math.sin(pitchRad));
             float frontZ = (float) ( Math.cos(yawRad) * Math.cos(pitchRad));
+            lastPosX = (float) player.posX;
+            lastPosY = (float) (player.posY + player.getEyeHeight());
+            lastPosZ = (float) player.posZ;
+            lastFrontX = frontX;
+            lastFrontY = frontY;
+            lastFrontZ = frontZ;
 
             link.update(
-                    (float)  player.posX,
-                    (float) (player.posY + player.getEyeHeight()),
-                    (float)  player.posZ,
+                    lastPosX,
+                    lastPosY,
+                    lastPosZ,
                     frontX, frontY, frontZ);
 
             // ---- Identity (player name) ------------------------------------
@@ -217,6 +277,7 @@ public final class TickHandler implements Runnable {
                     ctxBytes = newCtx.getBytes();
                 }
                 link.setContext(ctxBytes);
+                lastKnownContext = newCtx;
 
                 // Notify the player about the context change (but suppress the
                 // very first context write that happens right after linking).
@@ -229,6 +290,9 @@ public final class TickHandler implements Runnable {
         } catch (Exception e) {
             // Write failure means the shared memory is no longer accessible
             // (e.g. Mumble was closed while the world was loaded).
+            linkWriteFailures++;
+            linkLossCount++;
+            recordError("Link write failure: " + e);
             LOGGER.warning("[MumbleLink] Link error – shared memory lost: " + e);
             enqueue(buildInactiveMessage());
             link        = null;
@@ -242,7 +306,7 @@ public final class TickHandler implements Runnable {
 
     /** Queues a message for delivery on the next tick. */
     private void enqueue(String message) {
-        pendingMessages.add(message);
+        pendingMessages.add(new PendingChatMessage(message, 0));
     }
 
     /**
@@ -250,12 +314,20 @@ public final class TickHandler implements Runnable {
      * Called each tick when mc.thePlayer is confirmed non-null.
      */
     private void drainMessages(EntityClientPlayerMP player) {
-        String msg;
-        while ((msg = pendingMessages.poll()) != null) {
+        PendingChatMessage pending;
+        while ((pending = pendingMessages.poll()) != null) {
             try {
-                sendChatMessage(player, msg);
+                sendChatMessage(player, pending.text);
+                chatSentCount++;
             } catch (Exception e) {
+                chatSendFailures++;
+                recordError("Chat delivery failure: " + e);
                 LOGGER.fine("[MumbleLink] Could not send chat message: " + e);
+                int nextAttempt = pending.attempts + 1;
+                if (nextAttempt <= MAX_CHAT_RETRIES) {
+                    chatRetryCount++;
+                    pendingMessages.add(new PendingChatMessage(pending.text, nextAttempt));
+                }
             }
         }
     }
@@ -276,25 +348,74 @@ public final class TickHandler implements Runnable {
     private void sendChatMessage(EntityClientPlayerMP player, String msg) throws Exception {
         Method addChat = cachedAddChatMethod;
         if (addChat == null) {
-            addChat = resolveAddChatMethod(player.getClass());
+            addChat = resolveAddChatMethod(player.getClass(), "addChatMessage", "func_145747_a");
             cachedAddChatMethod = addChat;
         }
-        if (addChat == null) {
-            throw new NoSuchMethodException("addChatMessage(*) not found on " + player.getClass());
+        if (addChat != null) {
+            Class<?> paramType = addChat.getParameterTypes()[0];
+            Object arg = buildChatArgument(paramType, msg);
+            addChat.invoke(player, arg);
+            chatDeliveryMode = "player:" + addChat.getName() + "(" + paramType.getSimpleName() + ")";
+            return;
         }
 
-        Class<?> paramType = addChat.getParameterTypes()[0];
-        Object arg = buildChatArgument(paramType, msg);
-        addChat.invoke(player, arg);
+        // Fallback to client chat GUI print path for environments where player
+        // chat methods are unavailable/mapped differently.
+        if (tryGuiPrint(player, msg)) {
+            return;
+        }
+        throw new NoSuchMethodException("Chat delivery method not found on " + player.getClass());
     }
 
     /** Finds addChatMessage with exactly one parameter on the runtime player class. */
-    private static Method resolveAddChatMethod(Class<?> playerClass) {
+    private static Method resolveAddChatMethod(Class<?> playerClass, String nameA, String nameB) {
         Method[] methods = playerClass.getMethods();
         for (Method m : methods) {
-            if ("addChatMessage".equals(m.getName()) && m.getParameterTypes().length == 1) {
+            if ((nameA.equals(m.getName()) || nameB.equals(m.getName()))
+                    && m.getParameterTypes().length == 1) {
                 m.setAccessible(true);
                 return m;
+            }
+        }
+        return null;
+    }
+
+    /** Attempts GUI chat print fallback paths used by MC 1.6.4 variants. */
+    private boolean tryGuiPrint(EntityClientPlayerMP player, String msg) {
+        try {
+            Minecraft mc = Minecraft.getMinecraft();
+            if (mc == null) return false;
+            Object gui = mc.ingameGUI;
+            if (gui == null) return false;
+
+            Method print = cachedGuiPrintMethod;
+            if (print == null) {
+                print = resolveGuiPrintMethod(gui.getClass());
+                cachedGuiPrintMethod = print;
+            }
+            if (print == null) return false;
+
+            Class<?> paramType = print.getParameterTypes()[0];
+            Object arg = buildChatArgument(paramType, msg);
+            print.invoke(gui, arg);
+            chatDeliveryMode = "gui:" + print.getName() + "(" + paramType.getSimpleName() + ")";
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Method resolveGuiPrintMethod(Class<?> guiClass) {
+        Method[] methods = guiClass.getMethods();
+        for (Method m : methods) {
+            if (m.getParameterTypes().length == 1) {
+                String name = m.getName();
+                if ("printChatMessage".equals(name)
+                        || "func_73827_b".equals(name)
+                        || "addChatMessage".equals(name)) {
+                    m.setAccessible(true);
+                    return m;
+                }
             }
         }
         return null;
@@ -354,6 +475,7 @@ public final class TickHandler implements Runnable {
      * searched for.
      */
     private void sendWorldJoinBanner(Minecraft mc) {
+        joinBannerCount++;
         String os    = System.getProperty("os.name", "unknown");
         String ver   = MumbleLinkMod.VERSION;
 
@@ -411,6 +533,159 @@ public final class TickHandler implements Runnable {
     }
 
     // -----------------------------------------------------------------------
+
+    private void recordError(String message) {
+        lastError = message;
+        lastErrorMs = System.currentTimeMillis();
+    }
+
+    /** Exposes command/help prefix for command output. */
+    public String getChatPrefix() {
+        return PREFIX;
+    }
+
+    /** Enqueue any command-generated message for in-game display. */
+    public void enqueueCommandMessage(String message) {
+        enqueue(message);
+    }
+
+    /** Re-displays join status banner for the current world context. */
+    public void resendWorldJoinBanner() {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc != null && mc.thePlayer != null) {
+            sendWorldJoinBanner(mc);
+        } else {
+            enqueue(PREFIX + C_RED + "Cannot show banner: no world loaded." + C_RESET);
+        }
+    }
+
+    /** Forces a reconnect attempt on the next tick. */
+    public synchronized void forceReconnect() {
+        if (link != null) {
+            try {
+                link.unlink();
+            } catch (Exception ignored) { }
+        }
+        link = null;
+        lastContext = "";
+        enqueue(PREFIX + C_YELLOW + "Reconnect requested. Re-opening Mumble link..." + C_RESET);
+    }
+
+    /** Returns a snapshot used by /mumble diagnostics output. */
+    public Snapshot snapshot() {
+        return new Snapshot(
+                threadStartMs,
+                tickCount,
+                worldJoinCount,
+                worldLeaveCount,
+                linkOpenAttempts,
+                linkOpenSuccesses,
+                linkLossCount,
+                linkWriteFailures,
+                link != null,
+                wasInWorld,
+                pendingMessages.size(),
+                chatSentCount,
+                chatSendFailures,
+                chatRetryCount,
+                joinBannerCount,
+                lastTickMs,
+                lastErrorMs,
+                safe(lastError),
+                safe(lastKnownPlayer),
+                safe(lastKnownContext),
+                lastPosX, lastPosY, lastPosZ,
+                lastFrontX, lastFrontY, lastFrontZ,
+                safe(chatDeliveryMode)
+        );
+    }
+
+    private static String safe(String v) {
+        return v == null ? "" : v;
+    }
+
+    /** Immutable diagnostics payload for /mumble. */
+    public static final class Snapshot {
+        public final long threadStartMs;
+        public final long tickCount;
+        public final long worldJoinCount;
+        public final long worldLeaveCount;
+        public final long linkOpenAttempts;
+        public final long linkOpenSuccesses;
+        public final long linkLossCount;
+        public final long linkWriteFailures;
+        public final boolean linkActive;
+        public final boolean inWorld;
+        public final int pendingMessages;
+        public final long chatSentCount;
+        public final long chatSendFailures;
+        public final long chatRetryCount;
+        public final long joinBannerCount;
+        public final long lastTickMs;
+        public final long lastErrorMs;
+        public final String lastError;
+        public final String lastKnownPlayer;
+        public final String lastKnownContext;
+        public final float lastPosX, lastPosY, lastPosZ;
+        public final float lastFrontX, lastFrontY, lastFrontZ;
+        public final String chatDeliveryMode;
+
+        private Snapshot(long threadStartMs, long tickCount, long worldJoinCount,
+                         long worldLeaveCount, long linkOpenAttempts, long linkOpenSuccesses,
+                         long linkLossCount, long linkWriteFailures, boolean linkActive,
+                         boolean inWorld, int pendingMessages, long chatSentCount,
+                         long chatSendFailures, long chatRetryCount, long joinBannerCount,
+                         long lastTickMs, long lastErrorMs, String lastError,
+                         String lastKnownPlayer, String lastKnownContext,
+                         float lastPosX, float lastPosY, float lastPosZ,
+                         float lastFrontX, float lastFrontY, float lastFrontZ,
+                         String chatDeliveryMode) {
+            this.threadStartMs = threadStartMs;
+            this.tickCount = tickCount;
+            this.worldJoinCount = worldJoinCount;
+            this.worldLeaveCount = worldLeaveCount;
+            this.linkOpenAttempts = linkOpenAttempts;
+            this.linkOpenSuccesses = linkOpenSuccesses;
+            this.linkLossCount = linkLossCount;
+            this.linkWriteFailures = linkWriteFailures;
+            this.linkActive = linkActive;
+            this.inWorld = inWorld;
+            this.pendingMessages = pendingMessages;
+            this.chatSentCount = chatSentCount;
+            this.chatSendFailures = chatSendFailures;
+            this.chatRetryCount = chatRetryCount;
+            this.joinBannerCount = joinBannerCount;
+            this.lastTickMs = lastTickMs;
+            this.lastErrorMs = lastErrorMs;
+            this.lastError = lastError;
+            this.lastKnownPlayer = lastKnownPlayer;
+            this.lastKnownContext = lastKnownContext;
+            this.lastPosX = lastPosX;
+            this.lastPosY = lastPosY;
+            this.lastPosZ = lastPosZ;
+            this.lastFrontX = lastFrontX;
+            this.lastFrontY = lastFrontY;
+            this.lastFrontZ = lastFrontZ;
+            this.chatDeliveryMode = chatDeliveryMode;
+        }
+
+        public List<String> toDiagnosticLines() {
+            List<String> out = new ArrayList<String>();
+            out.add("Thread start ms: " + threadStartMs + " | last tick ms: " + lastTickMs + " | ticks: " + tickCount);
+            out.add("World state: inWorld=" + inWorld + " joins=" + worldJoinCount + " leaves=" + worldLeaveCount);
+            out.add("Link state: active=" + linkActive + " openAttempts=" + linkOpenAttempts + " openSuccesses=" + linkOpenSuccesses + " losses=" + linkLossCount);
+            out.add("Context: " + lastKnownContext + " | player: " + lastKnownPlayer);
+            out.add("Position: [" + lastPosX + ", " + lastPosY + ", " + lastPosZ + "] front=[" + lastFrontX + ", " + lastFrontY + ", " + lastFrontZ + "]");
+            out.add("Chat: sent=" + chatSentCount + " failures=" + chatSendFailures + " retries=" + chatRetryCount + " pending=" + pendingMessages + " mode=" + chatDeliveryMode);
+            out.add("Banners shown: " + joinBannerCount + " | write failures: " + linkWriteFailures);
+            if (lastError != null && lastError.length() > 0) {
+                out.add("Last error@" + lastErrorMs + ": " + lastError);
+            } else {
+                out.add("Last error: none");
+            }
+            return out;
+        }
+    }
 
     private static String buildContext(Minecraft mc) {
         try {
