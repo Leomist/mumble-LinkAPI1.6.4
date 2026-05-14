@@ -17,7 +17,18 @@ Please review the [LinkAPI.h](https://github.com/zsawyer/mumble-LinkAPI/blob/mas
 Changelog:
 ----------
 
-1.1.3
+1.1.4
+- add in-game chat notifications for all Mumble link state changes:
+  - world join: status banner showing mod version, OS, and current link state
+    (searching or already active)
+  - link established: green "ACTIVE" message with server context and player name
+  - link restored after mid-session loss: green "RESTORED" message
+  - link lost (Mumble closed / write error): red "INACTIVE" message with
+    retry hint
+  - context change (different server within same session): gold update message
+- chat messages are queued via ConcurrentLinkedQueue and delivered safely from
+  the background polling thread via mc.thePlayer.addChatMessage()
+
 - eliminate intermediate native DLL entirely:
   - implement Mumble Link shared-memory protocol directly in Java via JNA
   - `MumbleLink.java` opens Windows "MumbleLink" named mapping or Linux
